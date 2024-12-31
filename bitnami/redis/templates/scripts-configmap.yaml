@@ -397,7 +397,44 @@ data:
     fi
 
     if [[ "$REDIS_SENTINEL_STANDALONE" == "true" ]]; then
-        REDIS_MASTER_HOST={{ template "common.names.fullname" . }}-node-0.$HEADLESS_SERVICE
+        info "Standalone mode enabled, searching for master..."
+        master_found=false
+
+        # Try sentinel sidecars on statefulset pods
+        for node in $(seq 0 $(( {{ .Values.replica.replicaCount }} - 1 ))); do
+            info "Iterating over node-$node sentinel sidecar"
+            if timeout 5 redis-cli -h {{ template "common.names.fullname" . }}-node-$node.$HEADLESS_SERVICE -p {{ .Values.sentinel.containerPorts.sentinel }} ping > /dev/null 2>&1; then
+                existing_master=$(redis-cli -h {{ template "common.names.fullname" . }}-node-$node.$HEADLESS_SERVICE -p {{ .Values.sentinel.containerPorts.sentinel }} sentinel get-master-addr-by-name {{ .Values.sentinel.masterSet }} | head -n 1)
+                if [[ -n "$existing_master" ]]; then
+                    REDIS_MASTER_HOST="$existing_master"
+                    info "Found existing master at $REDIS_MASTER_HOST"
+                    master_found=true
+                    break
+                fi
+            fi
+        done
+
+        # If no sentinel found, try Redis nodes directly
+        if [[ "$master_found" == "false" ]]; then
+            for node in $(seq 0 $(( {{ .Values.replica.replicaCount }} - 1 ))); do
+                info "Iterating over node-$node redis node"
+                if timeout 5 redis-cli -h {{ template "common.names.fullname" . }}-node-$node.$HEADLESS_SERVICE -p $REDIS_MASTER_PORT_NUMBER ping > /dev/null 2>&1; then
+                    role=$(redis-cli -h {{ template "common.names.fullname" . }}-node-$node.$HEADLESS_SERVICE -p $REDIS_MASTER_PORT_NUMBER info replication | grep "^role:" | cut -d: -f2 | tr -d '[:space:]')
+                    if [[ "$role" == "master" ]]; then
+                        REDIS_MASTER_HOST={{ template "common.names.fullname" . }}-node-$node.$HEADLESS_SERVICE
+                        info "Found active master at node-$node"
+                        master_found=true
+                        break
+                    fi
+                fi
+            done
+        fi
+
+        # Fallback to node-0 if nothing found
+        if [[ "$master_found" == "false" ]]; then
+            REDIS_MASTER_HOST={{ template "common.names.fullname" . }}-node-0.$HEADLESS_SERVICE
+            info "No active master found, falling back to node-0"
+        fi
     fi
 
     sentinel_conf_set "sentinel monitor" "{{ .Values.sentinel.masterSet }} "$REDIS_MASTER_HOST" "$REDIS_MASTER_PORT_NUMBER" {{ .Values.sentinel.quorum }}"
@@ -420,7 +457,7 @@ data:
     }
 
     # Add available hosts on the network as known replicas & sentinels
-    for node in $(seq 0 $(({{ .Values.replica.replicaCount }}-1))); do
+    for node in $(seq 0 $(( {{ .Values.replica.replicaCount }} - 1 ))); do
         hostname="{{ template "common.names.fullname" . }}-node-$node"
         ip="$(getent hosts "$hostname.$HEADLESS_SERVICE" | awk '{ print $1 }')"
         add_known_sentinel "$hostname" "$ip"
